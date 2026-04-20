@@ -1,0 +1,127 @@
+name: "Weekly Upstream Check"
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # every Monday at 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip build/push and force the notification path (for testing)"
+        type: boolean
+        default: false
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get upstream HEAD hash
+        id: upstream
+        run: |
+          HASH=$(git ls-remote https://github.com/LedgerHQ/ledger-app-builder | head -n 1 | awk '{print $1}')
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          echo "Upstream HEAD: $HASH"
+
+      - name: Check if image tag already exists on Docker Hub
+        id: check
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "dry_run=true" >> $GITHUB_OUTPUT
+            echo "Dry run — forcing notification path, skipping build."
+            exit 0
+          fi
+          echo "dry_run=false" >> $GITHUB_OUTPUT
+          TAG="ledger-${{ steps.upstream.outputs.hash }}"
+          if curl -sfL "https://hub.docker.com/v2/repositories/zondax/ledger-app-builder/tags/${TAG}" > /dev/null; then
+            echo "needs_build=false" >> $GITHUB_OUTPUT
+            echo "Tag ${TAG} already published — nothing to do."
+          else
+            echo "needs_build=true" >> $GITHUB_OUTPUT
+            echo "Tag ${TAG} missing — will rebuild."
+          fi
+
+      - name: Repo short SHA
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        id: hash
+        run: echo "hash=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up QEMU
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        uses: docker/setup-buildx-action@v2
+
+      - name: Free disk space
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - name: Login to Docker Hub
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        if: steps.check.outputs.needs_build == 'true' && steps.check.outputs.dry_run != 'true'
+        uses: docker/build-push-action@v4
+        with:
+          context: ledger-app-builder
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: >-
+            zondax/ledger-app-builder:${{ steps.hash.outputs.hash }},
+            zondax/ledger-app-builder:latest,
+            zondax/ledger-app-builder:ledger-${{ steps.upstream.outputs.hash }}
+
+      - name: Open notification issue
+        if: steps.check.outputs.needs_build == 'true' && success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'upstream-update',
+                color: 'fbca04',
+                description: 'Ledger upstream changed; new image rebuilt',
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+            }
+            const upstream = '${{ steps.upstream.outputs.hash }}';
+            const short = upstream.substring(0, 7);
+            const dryRun = '${{ steps.check.outputs.dry_run }}' === 'true';
+            const titlePrefix = dryRun ? '[DRY-RUN] ' : '';
+            const dryBanner = dryRun
+              ? `> **Dry run** — no image was built or pushed. This issue only exercises the notification path.\n\n`
+              : '';
+            const body = dryBanner + [
+              `LedgerHQ's \`ledger-app-builder\` upstream is at [\`${short}\`](https://github.com/LedgerHQ/ledger-app-builder/commit/${upstream}).`,
+              ``,
+              `A fresh \`zondax/ledger-app-builder\` image ${dryRun ? 'would be' : 'has been'} published with tags:`,
+              `- \`zondax/ledger-app-builder:ledger-${upstream}\``,
+              `- \`zondax/ledger-app-builder:latest\``,
+              ``,
+              `**Action:** bump the image hash in \`zxlib\`'s \`dockerized_build.mk\` to pick up the new SDK.`,
+              ``,
+              `_Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}_`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `${titlePrefix}Ledger app-builder updated: ${short}`,
+              body,
+              labels: ['upstream-update'],
+            });
